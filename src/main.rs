@@ -11,27 +11,29 @@ fn main() -> Result<(), std::io::Error> {
     let pgm = Pgm::parse();
 
     let config = Postgres::parse()?;
-    let path = pgm
-        .path
-        .unwrap_or_else(|| get_absolute_migration_path().unwrap());
+    let path = if let Some(p) = pgm.path {
+        p
+    } else if let MigrationSubcommand::Setup = pgm.command {
+        match get_absolute_migration_path() {
+            Ok(p) => p,
+            Err(_) => {
+                println!("Migration directory not found, creating.");
+                let pwd = env::current_dir()?;
+                let pwd = pwd.to_str().unwrap();
+                let path = format!("{pwd}/migrations");
+                std::fs::create_dir(&path)?;
+                path
+            }
+        }
+    } else {
+        get_absolute_migration_path().unwrap()
+    };
+
     let mut pg = config.establish_connection();
 
     if let Err(e) = {
         match pgm.command {
-            MigrationSubcommand::Setup => {
-                let path = match get_absolute_migration_path() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        println!("Migration directory not found, creating.");
-                        let pwd = env::current_dir()?;
-                        let pwd = pwd.to_str().unwrap();
-                        let path = format!("{pwd}/migrations");
-                        std::fs::create_dir(&path)?;
-                        path
-                    }
-                };
-                setup(&path, &mut pg)
-            }
+            MigrationSubcommand::Setup => setup(&path, &mut pg),
             MigrationSubcommand::Gen(args) => migration_generate(args, &path, pg),
             MigrationSubcommand::Run(args) => migration_run(args, &path, pg),
             MigrationSubcommand::Rev(args) => migration_rev(args, &path, pg),
