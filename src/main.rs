@@ -119,7 +119,7 @@ fn get_absolute_migration_path() -> Result<String, std::io::Error> {
 
     let path = String::from_utf8(mig_dir[1..].to_vec()).unwrap();
     let path = path.trim();
-    println!("Found migrations directory at: {path}");
+    println!("Found migrations directory at: {pwd}{path}");
 
     Ok(format!("{pwd}{path}"))
 }

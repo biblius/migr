@@ -34,7 +34,7 @@ pub fn migration_generate(args: GenMigration, path: &str, mut pg: Client) -> Res
     println!("Setting up metadata table");
 
     pg.execute("INSERT INTO __pgm_meta__ VALUES ($1, TRUE)", &[&time])
-        .expect("Could not insert into ");
+        .expect("Could not insert into metadata table");
 
     fs::create_dir(&mig_path)?;
     fs::write(mig_path.clone() + "/up.sql", "")?;
@@ -45,6 +45,7 @@ pub fn migration_generate(args: GenMigration, path: &str, mut pg: Client) -> Res
 
 pub fn migration_run(args: RunRevMigration, path: &str, mut pg: Client) -> Result<(), Error> {
     println!("Running migrations");
+    sync(path, &mut pg)?;
     migration_up(args, path, &mut pg)
 }
 
@@ -71,6 +72,44 @@ fn migration_up(args: RunRevMigration, path: &str, pg: &mut Client) -> Result<()
     let paths = migration_files(path, UpDown::Up)?;
     let meta = migration_meta(&paths, pg, UpDown::Up)?;
     migration_execute(args, &paths, meta, pg, UpDown::Up)
+}
+
+fn sync(path: &str, pg: &mut Client) -> Result<(), Error> {
+    if let Err(e) = pg.query_one("SELECT id FROM __pgm_meta__ WHERE id=0", &[]) {
+        let err = e.to_string();
+        if err.contains("relation \"__pgm_meta__\" does not exist") {
+            pg.batch_execute(
+                "
+            CREATE TABLE __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
+            INSERT INTO __pgm_meta__ VALUES (0, TRUE)
+            ",
+            )
+            .expect("Could not create metadata table")
+        } else {
+            return Err(Error::new(io::ErrorKind::Other, err));
+        }
+    }
+
+    let rd = fs::read_dir(path)?;
+
+    for dir in rd {
+        let dir = dir?.file_name();
+        let mig = dir.to_str().unwrap();
+
+        let mig_id: i64 = mig
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("Invalid ID found in migrations directory");
+
+        pg.execute(
+            "INSERT INTO __pgm_meta__ VALUES ($1, TRUE) ON CONFLICT DO NOTHING",
+            &[&mig_id],
+        )
+        .expect("Could not insert migration to metadata table");
+    }
+    Ok(())
 }
 
 fn migration_down(args: RunRevMigration, path: &str, pg: &mut Client) -> Result<(), Error> {
@@ -111,7 +150,7 @@ pub fn setup(path: &str, pg: &mut Client) -> Result<(), Error> {
 --
 -- SELECT pgm_manage_updated_at('users');
 -- ```
-;
+CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";
 
 CREATE OR REPLACE FUNCTION pgm_manage_updated_at(_tbl regclass) RETURNS VOID AS $$
 
@@ -143,6 +182,8 @@ $$ LANGUAGE plpgsql;
 -- This file was automatically created by the migrator to setup helper functions
 -- and other internal bookkeeping. This file is safe to edit, any future
 -- changes will be added to existing projects as new migrations.
+DROP EXTENSION IF EXISTS \"uuid-ossp\";
+
 DROP FUNCTION IF EXISTS pgm_manage_updated_at(_tbl regclass);
 
 DROP FUNCTION IF EXISTS pgm_set_updated_at();
