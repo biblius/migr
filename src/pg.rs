@@ -32,7 +32,7 @@ impl Postgres {
                     pg.print();
                     io::stdout().flush()?;
                     stdin().read_line(&mut buf)?;
-                    pg.set(&buf)?;
+                    pg.set(buf.trim())?;
                     buf.clear();
                     if pg.state == ParserState::Done {
                         break;
@@ -58,12 +58,16 @@ impl Postgres {
     fn set(&mut self, buf: &str) -> Result<(), Error> {
         match self.state {
             ParserState::Host => {
-                self.host = buf.trim().to_string();
+                if buf.is_empty() {
+                    self.next();
+                    return Ok(());
+                }
+                self.host = buf.to_string();
                 self.next();
                 Ok(())
             }
             ParserState::Port => {
-                if buf.trim().is_empty() {
+                if buf.is_empty() {
                     self.next();
                     return Ok(());
                 }
@@ -74,17 +78,17 @@ impl Postgres {
                 Ok(())
             }
             ParserState::User => {
-                self.user = buf.trim().to_string();
+                self.user = buf.to_string();
                 self.next();
                 Ok(())
             }
             ParserState::DB => {
-                self.database = buf.trim().to_string();
+                self.database = buf.to_string();
                 self.next();
                 Ok(())
             }
             ParserState::PW => {
-                self.password = buf.trim().to_string();
+                self.password = buf.to_string();
                 self.next();
                 Ok(())
             }

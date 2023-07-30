@@ -111,7 +111,10 @@ fn get_absolute_migration_path() -> Result<String, std::io::Error> {
         .stdout;
 
     if mig_dir.is_empty() {
-        panic!("Migrations directory not found")
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Migrations directory not found",
+        ));
     }
 
     let path = String::from_utf8(mig_dir[1..].to_vec()).unwrap();

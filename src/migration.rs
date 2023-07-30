@@ -85,7 +85,7 @@ pub fn setup(path: &str, pg: &mut Client) -> Result<(), Error> {
 
     pg.batch_execute(
         "
-        CREATE TABLE IF NOT EXISTS __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
+        CREATE TABLE __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
         INSERT INTO __pgm_meta__ VALUES (0, TRUE) ON CONFLICT (id) DO UPDATE SET pending=TRUE
         ",
     )
