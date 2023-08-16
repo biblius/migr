@@ -125,7 +125,7 @@ pub fn setup(path: &str, pg: &mut Client) -> Result<(), Error> {
     pg.batch_execute(
         "
         CREATE TABLE __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
-        INSERT INTO __pgm_meta__ VALUES (0, TRUE) ON CONFLICT (id) DO UPDATE SET pending=TRUE
+        INSERT INTO __pgm_meta__ VALUES (0, TRUE)
         ",
     )
     .expect("Could not create initial table");
