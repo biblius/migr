@@ -1,0 +1,1 @@
+-- Revert everything from up.sql

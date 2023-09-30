@@ -1,1 +1,0 @@
-create table rofl(id serial primary key);

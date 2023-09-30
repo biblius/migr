@@ -1,17 +1,24 @@
 [package]
 edition = "2021"
-name = "pgm"
+name = "migr"
 version = "0.1.0"
+description = "A minimal migration tool for postgres."
+license = "MIT"
+homepage = "https://github.com/biblius/pg_migrator"
+keywords = ["sql", "migration", "postgres"]
+authors = ["biblius <crazycompanyxxl@gmail.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.75"
 clap = { version = "4.3.19", features = ["derive"] }
+colored = "2.0.4"
 postgres = "0.19.5"
+time = "0.3.29"
 
 [profile.release]
-codegen-units = 1
-lto = true
-opt-level = "z"
-panic = "abort"
-strip = true
+codegen-units = 1 # https://doc.rust-lang.org/rustc/codegen-options/index.html#codegen-units
+lto = true        # https://doc.rust-lang.org/rustc/codegen-options/index.html#lto
+opt-level = "z"   # https://doc.rust-lang.org/rustc/codegen-options/index.html#opt-level
+strip = "symbols" # https://doc.rust-lang.org/rustc/codegen-options/index.html#strip

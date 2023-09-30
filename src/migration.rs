@@ -1,264 +1,426 @@
-use crate::{GenMigration, RedoMigration, RunRevMigration};
-use postgres::Client;
-use std::{
-    fs,
-    io::{self, Error},
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use crate::{info, trace, GenMigration, RunRevMigration};
+use anyhow::{Context, Error};
+use colored::Colorize;
+use postgres::{Client, Transaction};
+use std::collections::HashSet;
+use std::fmt::{Display, Write};
+use std::{fs, path::PathBuf};
 
 const INITIAL: &str = "0000000000_pg_migrator";
 
-pub fn migration_generate(args: GenMigration, path: &str, mut pg: Client) -> Result<(), Error> {
-    let init_exists = fs::read_dir(path)?.any(|dir| {
-        dir.as_ref()
-            .is_ok_and(|entry| entry.file_name().to_str().is_some_and(|e| e == INITIAL))
-    });
+const INITIAL_TABLE_QUERY: &str = "
+CREATE TABLE __migr_meta__(
+    id VARCHAR(255) PRIMARY KEY,
+    pending BOOLEAN DEFAULT TRUE
+)";
 
-    if !init_exists {
-        if !args.force {
-            return Err(Error::new(
-                io::ErrorKind::Other,
-                "Initial migration could not be found, run with -f to create it",
-            ));
-        }
-        println!("Creating initial migration file");
-        setup(path, &mut pg)?;
-    }
+const INITIAL_ENTRY_QUERY: &str = "
+INSERT INTO __migr_meta__ VALUES (0, TRUE)
+";
 
+pub fn migration_generate(
+    args: &GenMigration,
+    mut path: PathBuf,
+    mut pg: Client,
+) -> anyhow::Result<()> {
+    check_table(&mut pg)?;
     let name = &args.name;
-    let time = timestamp();
+    let date = time::OffsetDateTime::now_utc();
+    let (date, (h, m, s)) = (date.date(), date.time().as_hms());
 
-    let mig_path = format!("{path}/{time}_{name}");
+    let full_name = format!("{date}-{h:02}{m:02}{s:02}_{name}");
 
-    println!("Setting up metadata table");
+    path.push(&full_name);
 
-    pg.execute("INSERT INTO __pgm_meta__ VALUES ($1, TRUE)", &[&time])
-        .expect("Could not insert into metadata table");
+    info!(
+        "Creating migration at {}",
+        path.display().to_string().as_str().yellow()
+    );
 
-    fs::create_dir(&mig_path)?;
-    fs::write(mig_path.clone() + "/up.sql", "")?;
-    fs::write(mig_path + "/down.sql", "--Revert everything from up.sql")?;
-    println!("Successfully generated migration {name}");
+    fs::create_dir(&path)?;
+
+    path.push("up.sql");
+
+    info!(
+        "Creating up migration at {}",
+        path.display().to_string().as_str().green()
+    );
+
+    fs::write(&path, "")?;
+
+    path.pop();
+    path.push("down.sql");
+
+    info!(
+        "Creating down migration at {}",
+        path.display().to_string().as_str().bright_red()
+    );
+
+    fs::write(path, "-- Revert everything from up.sql")?;
+
+    trace!("Updating metadata table");
+
+    pg.execute("INSERT INTO __migr_meta__ VALUES ($1, TRUE)", &[&full_name])
+        .context("Could not insert into __migr_meta__")?;
+
+    info!("Successfully generated migration {}", name.green());
+
     Ok(())
 }
 
-pub fn migration_run(args: RunRevMigration, path: &str, mut pg: Client) -> Result<(), Error> {
-    println!("Running migrations");
-    sync(path, &mut pg)?;
-    migration_up(args, path, &mut pg)
-}
+pub fn migration_run(args: &RunRevMigration, path: PathBuf, mut pg: Client) -> anyhow::Result<()> {
+    check_table(&mut pg)?;
 
-pub fn migration_rev(mut args: RunRevMigration, path: &str, mut pg: Client) -> Result<(), Error> {
-    println!("Reverting migrations");
-    if args.count.is_none() {
-        args.count = Some(1)
+    if let Some(ref name) = args.exact {
+        return find_and_execute(&path, name, &mut pg, UpDown::Up);
     }
-    migration_down(args, path, &mut pg)
-}
 
-pub fn migration_redo(redo: RedoMigration, path: &str, mut pg: Client) -> Result<(), Error> {
-    println!("Redoing migrations");
-    let args = if redo.all {
-        RunRevMigration { count: None }
+    info!("Running migrations");
+    let count = args.count;
+    let count = migration_up(count, path, &mut pg)?;
+    if count > 0 {
+        info!("{count} migrations successfully executed");
     } else {
-        RunRevMigration { count: Some(1) }
+        info!("Migrations already up to date");
+    }
+    Ok(())
+}
+
+pub fn migration_rev(args: &RunRevMigration, path: PathBuf, mut pg: Client) -> anyhow::Result<()> {
+    check_table(&mut pg)?;
+
+    if let Some(ref name) = args.exact {
+        return find_and_execute(&path, name, &mut pg, UpDown::Down);
+    }
+
+    info!("Reverting migrations");
+    let count = args.count.or((!args.all).then_some(1));
+    let count = migration_down(count, &path, &mut pg)?;
+    if count > 0 {
+        info!("{count} migrations successfully reverted");
+    } else {
+        info!("Migrations already up to date");
+    }
+    Ok(())
+}
+
+pub fn migration_redo(args: &RunRevMigration, path: PathBuf, mut pg: Client) -> anyhow::Result<()> {
+    check_table(&mut pg)?;
+
+    if let Some(ref name) = args.exact {
+        find_and_execute(&path, name, &mut pg, UpDown::Down)?;
+        return find_and_execute(&path, name, &mut pg, UpDown::Up);
+    }
+
+    info!("Redoing migrations");
+    let count = args.count.or((!args.all).then_some(1));
+    migration_down(count, &path, &mut pg)?;
+    migration_up(count, path, &mut pg)?;
+    info!("Successfully redone migrations");
+    Ok(())
+}
+
+pub fn setup(mut path: PathBuf, pg: &mut Client) -> anyhow::Result<()> {
+    info!("Creating metadata table");
+
+    let query = format!("{INITIAL_TABLE_QUERY};{INITIAL_ENTRY_QUERY}");
+
+    if let Err(err) = pg.batch_execute(&query) {
+        let Some(e) = err.as_db_error() else {
+            return Err(err.into());
+        };
+
+        if *e.code() != postgres::error::SqlState::DUPLICATE_TABLE {
+            return Err(err.into());
+        }
+
+        return Err(err).context("The migr metadata table already exists. Run `migr sync` if you need to sync it with existing migrations.");
     };
-    migration_down(args, path, &mut pg)?;
-    migration_up(args, path, &mut pg)
+
+    info!("Creating migrations directory");
+
+    fs::create_dir(&path)
+        .with_context(|| format!("Unable to create migrations at '{}'", path.display()))?;
+
+    path.push(INITIAL);
+
+    fs::create_dir(&path)
+        .with_context(|| format!("Unable to create migration at '{}'", path.display()))?;
+
+    path.push("up.sql");
+
+    trace!("Setting up initial 'up' migration");
+
+    fs::write(&path, "-- Set up initial SQL dependencies here")?;
+
+    path.pop();
+    path.push("down.sql");
+
+    trace!("Setting up initial 'down' migration");
+
+    fs::write(&path, "-- Revert everything from up.sql")?;
+
+    info!(
+        "Successfully set up migrations directory at {}",
+        path.display().to_string().as_str().purple()
+    );
+
+    Ok(())
 }
 
-fn migration_up(args: RunRevMigration, path: &str, pg: &mut Client) -> Result<(), Error> {
-    let paths = migration_files(path, UpDown::Up)?;
-    let meta = migration_meta(&paths, pg, UpDown::Up)?;
-    migration_execute(args, &paths, meta, pg, UpDown::Up)
-}
+pub fn sync(trim: bool, path: &PathBuf, pg: &mut Client) -> anyhow::Result<()> {
+    info!("Syncing existing migrations with migr");
 
-fn sync(path: &str, pg: &mut Client) -> Result<(), Error> {
-    if let Err(e) = pg.query_one("SELECT id FROM __pgm_meta__ WHERE id=0", &[]) {
-        let err = e.to_string();
-        if err.contains("relation \"__pgm_meta__\" does not exist") {
-            pg.batch_execute(
-                "
-            CREATE TABLE __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
-            INSERT INTO __pgm_meta__ VALUES (0, TRUE)
-            ",
-            )
-            .expect("Could not create metadata table")
-        } else {
-            return Err(Error::new(io::ErrorKind::Other, err));
+    let mut mig_metas = match pg.query("SELECT id FROM __migr_meta__", &[]) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| r.get::<usize, String>(0))
+            .collect::<HashSet<_>>(),
+        Err(err) => {
+            let Some(e) = err.as_db_error() else {
+                return Err(Error::new(err));
+            };
+
+            if *e.code() != postgres::error::SqlState::UNDEFINED_TABLE {
+                return Err(Error::new(err));
+            }
+
+            pg.batch_execute(INITIAL_TABLE_QUERY)?;
+
+            info!("Successfully created metadata table");
+
+            HashSet::new()
+        }
+    };
+
+    let mut mig_dirs = fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect::<Vec<_>>();
+
+    mig_dirs.sort_by_key(|e| e.file_name());
+
+    let num_migs = mig_dirs.len();
+    let query = mig_dirs
+        .into_iter()
+        .filter_map(|d| d.file_name().to_str().map(String::from))
+        .enumerate()
+        .fold(
+            String::from("INSERT INTO __migr_meta__ VALUES "),
+            |mut query, (i, mig_name)| {
+                trace!("Syncing {} with metadata table", mig_name.blue());
+
+                if i == num_migs - 1 {
+                    // Ensures we only update entries not already present
+                    write!(query, "('{mig_name}', TRUE) ON CONFLICT DO NOTHING").unwrap();
+                } else {
+                    write!(query, "('{mig_name}', TRUE),").unwrap();
+                }
+
+                mig_metas.remove(&mig_name);
+                query
+            },
+        );
+
+    pg.execute(&query, &[])
+        .context("Could not insert into metadata table")?;
+
+    if trim {
+        for mig in mig_metas {
+            info!("Trimming {}", mig.blue());
+            pg.execute("DELETE FROM __migr_meta__ WHERE id = $1", &[&mig])?;
         }
     }
 
-    let rd = fs::read_dir(path)?;
+    info!("Successfully synced migr with existing migrations");
 
-    for dir in rd {
-        let dir = dir?.file_name();
-        let mig = dir.to_str().unwrap();
-
-        let mig_id: i64 = mig
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .expect("Invalid ID found in migrations directory");
-
-        pg.execute(
-            "INSERT INTO __pgm_meta__ VALUES ($1, TRUE) ON CONFLICT DO NOTHING",
-            &[&mig_id],
-        )
-        .expect("Could not insert migration to metadata table");
-    }
     Ok(())
 }
 
-fn migration_down(args: RunRevMigration, path: &str, pg: &mut Client) -> Result<(), Error> {
+fn migration_up(count: Option<usize>, path: PathBuf, pg: &mut Client) -> anyhow::Result<usize> {
+    let paths = migration_files(&path, UpDown::Up)?;
+    let meta = migration_meta(&paths, pg, UpDown::Up)?;
+    migrations_execute(count, &paths, &meta, pg, UpDown::Up)
+}
+
+fn migration_down(count: Option<usize>, path: &PathBuf, pg: &mut Client) -> anyhow::Result<usize> {
     let mut paths = migration_files(path, UpDown::Down)?;
     paths.reverse();
     let meta = migration_meta(&paths, pg, UpDown::Down)?;
-    migration_execute(args, &paths, meta, pg, UpDown::Down)
+    migrations_execute(count, &paths, &meta, pg, UpDown::Down)
 }
 
-pub fn setup(path: &str, pg: &mut Client) -> Result<(), Error> {
-    let path = format!("{path}/{INITIAL}");
+fn check_table(pg: &mut Client) -> anyhow::Result<()> {
+    if let Err(err) = pg.query("SELECT id FROM __migr_meta__ WHERE id='0'", &[]) {
+        let Some(e) = err.as_db_error() else {
+            return Err(Error::new(err));
+        };
 
-    pg.batch_execute(
-        "
-        CREATE TABLE __pgm_meta__(id BIGINT PRIMARY KEY, pending BOOLEAN DEFAULT TRUE);
-        INSERT INTO __pgm_meta__ VALUES (0, TRUE)
-        ",
-    )
-    .expect("Could not create initial table");
-
-    if let Err(e) = fs::create_dir(&path) {
-        if !matches!(e.kind(), io::ErrorKind::AlreadyExists) {
-            return Err(e);
+        if *e.code() != postgres::error::SqlState::UNDEFINED_TABLE {
+            return Err(Error::new(err));
         }
+
+        return Err(err).context(
+            "The metadata table does not exist.\nHint: Run `migr sync` to create it with existing migrations.",
+        );
     }
-
-    fs::write(
-        path.clone() + "/up.sql",
-        "\
--- Sets up a trigger for the given table to automatically set a column called
--- `updated_at` whenever the row is modified (unless `updated_at` was included
--- in the modified columns)
---
--- # Example
---
--- ```sql
--- CREATE TABLE users (id SERIAL PRIMARY KEY, updated_at TIMESTAMP NOT NULL DEFAULT NOW());
---
--- SELECT pgm_manage_updated_at('users');
--- ```
-CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";
-
-CREATE OR REPLACE FUNCTION pgm_manage_updated_at(_tbl regclass) RETURNS VOID AS $$
-
-BEGIN
-    EXECUTE format('CREATE TRIGGER set_updated_at BEFORE UPDATE ON %s
-    FOR EACH ROW EXECUTE PROCEDURE pgm_set_updated_at()', _tbl);
-END;
-
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION pgm_set_updated_at() RETURNS trigger AS $$
-BEGIN
-    IF (
-        NEW IS DISTINCT FROM OLD AND
-        NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at
-    ) THEN
-        NEW.updated_at := current_timestamp;
-    END IF;
-    RETURN NEW;
-END;
-
-$$ LANGUAGE plpgsql;
-",
-    )?;
-
-    fs::write(
-        path + "/down.sql",
-        "\
--- This file was automatically created by the migrator to setup helper functions
--- and other internal bookkeeping. This file is safe to edit, any future
--- changes will be added to existing projects as new migrations.
-DROP EXTENSION IF EXISTS \"uuid-ossp\";
-
-DROP FUNCTION IF EXISTS pgm_manage_updated_at(_tbl regclass);
-
-DROP FUNCTION IF EXISTS pgm_set_updated_at();
-",
-    )?;
-
     Ok(())
 }
 
-fn migration_execute(
-    args: RunRevMigration,
+fn find_and_execute(path: &PathBuf, name: &str, pg: &mut Client, ud: UpDown) -> anyhow::Result<()> {
+    let (path, id) = find_exact(path, name, pg)?;
+    match ud {
+        UpDown::Up => info!("Running migration {}", id.blue()),
+        UpDown::Down => info!("Reverting migration {}", id.blue()),
+    }
+    let file = format!("{}/{ud}", path.display());
+    let mut tx = pg.transaction()?;
+    match migration_execute_exact(&file.into(), &id, &mut tx, ud) {
+        Ok(_) => {
+            tx.commit()?;
+            Ok(())
+        }
+        Err(e) => {
+            tx.rollback()?;
+            Err(e)
+        }
+    }
+}
+
+/// Finds the exact migration by stripping the ts prefix in the name and returns its path and meta ID.
+/// `path` is a path pointing to the migrations dir.
+/// `name` is the name of the migration without the timestamp
+fn find_exact(path: &PathBuf, name: &str, pg: &mut Client) -> anyhow::Result<(PathBuf, String)> {
+    let Some(migration_path) = fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .find(|f| {
+            let path = f.path();
+            let Some(full_name) = path.file_name() else {
+                return false;
+            };
+            let Some(migration) = full_name.to_str().map(|n| n.to_string()) else {
+                return false;
+            };
+            let Some(prefix_end) = migration.chars().position(|c| c == '_') else {
+                return false;
+            };
+            name == &migration[prefix_end + 1..]
+        })
+        .map(|e| e.path())
+    else {
+        return Err(Error::msg(format!("No migration found for name '{name}'")));
+    };
+
+    let Some(name) = migration_path.file_name() else {
+        return Err(Error::msg("Unsupported file found for migration"));
+    };
+
+    let Some(name) = name.to_str() else {
+        return Err(Error::msg("Unsupported file found for migration"));
+    };
+
+    trace!(
+        "Found migration {}",
+        migration_path.display().to_string().blue()
+    );
+
+    let count = pg
+        .query_one("SELECT COUNT(*) from __migr_meta__ WHERE id = $1", &[&name])?
+        .get::<usize, i64>(0);
+
+    if count == 0 {
+        return Err(Error::msg(format!(
+            "No entry found in metadata for {}\nHint: Run `migr sync` to sync the metadata table",
+            name.red()
+        )));
+    }
+
+    let name = name.to_string();
+
+    Ok((migration_path, name))
+}
+
+fn migrations_execute(
+    exec_count: Option<usize>,
     paths: &[PathBuf],
-    meta: impl Iterator<Item = (i64, bool)>,
+    meta: &[(String, bool)],
     pg: &mut Client,
     ud: UpDown,
-) -> Result<(), Error> {
+) -> anyhow::Result<usize> {
     let mut count = 0;
 
-    for (path, (id, pending)) in paths.iter().zip(meta) {
-        if let Some(c) = args.count {
-            if count >= c {
+    let mut tx = pg.build_transaction().start()?;
+
+    for (path, (id, pending)) in paths.iter().zip(meta.iter()) {
+        if let Some(exec_count) = exec_count {
+            if count >= exec_count {
                 break;
             }
         }
 
-        match ud {
-            UpDown::Up => {
-                if !pending {
-                    continue;
-                }
-            }
-            UpDown::Down => {
-                if pending {
-                    continue;
-                }
-            }
+        if matches!(ud, UpDown::Up) && !pending {
+            continue;
         }
 
-        let sql = fs::read_to_string(path)?;
-
-        let name = path.to_str().unwrap_or_default();
-        let name = name.rsplit('/').nth(1).unwrap();
-
-        let mut tx = pg
-            .build_transaction()
-            .start()
-            .expect("Error when starting transaction");
-
-        if let Err(e) = tx.batch_execute(&sql) {
-            tx.rollback().expect("Error when rolling back transaction");
-            panic!("Error when running migration {e}");
+        if matches!(ud, UpDown::Down) && *pending {
+            continue;
         }
 
-        let query = match ud {
-            UpDown::Up => "UPDATE __pgm_meta__ SET pending=FALSE WHERE id=$1",
-            UpDown::Down => "UPDATE __pgm_meta__ SET pending=TRUE WHERE id=$1",
+        if let Err(e) = migration_execute_exact(path, id, &mut tx, ud) {
+            tx.rollback()?;
+            return Err(e);
         };
-        if let Err(e) = tx.execute(query, &[&id]) {
-            tx.rollback().expect("Error when rolling back transaction");
-            panic!("Error in attempt to update migrations {e}");
-        }
-
-        tx.commit().expect("Error when committing transaction");
 
         count += 1;
 
-        match ud {
-            UpDown::Up => println!("Executed up migration: {name}"),
-            UpDown::Down => println!("Executed down migration: {name}"),
-        }
+        info!("Executed {}", path.display().to_string().blue());
     }
 
+    tx.commit()?;
+
+    Ok(count)
+}
+
+fn migration_execute_exact(
+    path: &PathBuf,
+    id: &str,
+    tx_outer: &mut Transaction<'_>,
+    ud: UpDown,
+) -> anyhow::Result<()> {
+    let sql = fs::read_to_string(path)?;
+
+    let mut tx = tx_outer.transaction()?;
+
+    if let Err(e) = tx.batch_execute(&sql) {
+        tx.rollback()?;
+        return Err(e).with_context(|| {
+            format!(
+                "while executing migration {}",
+                path.display().to_string().red(),
+            )
+        });
+    }
+
+    let query = match ud {
+        UpDown::Up => "UPDATE __migr_meta__ SET pending=FALSE WHERE id=$1",
+        UpDown::Down => "UPDATE __migr_meta__ SET pending=TRUE WHERE id=$1",
+    };
+
+    if let Err(e) = tx.execute(query, &[&id]) {
+        tx.rollback()?;
+        return Err(e).with_context(|| {
+            format!(
+                "while executing migration {}",
+                path.display().to_string().red(),
+            )
+        });
+    }
+
+    tx.commit()?;
+
     match ud {
-        UpDown::Up => println!("Migrations successfully executed"),
-        UpDown::Down => println!("Migrations successfully reverted"),
+        UpDown::Up => info!("Successfully executed migration"),
+        UpDown::Down => info!("Successfully reverted migration"),
     }
 
     Ok(())
@@ -268,102 +430,79 @@ fn migration_meta(
     paths: &[PathBuf],
     pg: &mut Client,
     ud: UpDown,
-) -> Result<impl Iterator<Item = (i64, bool)>, Error> {
+) -> Result<Vec<(String, bool)>, Error> {
     let mig_ids = paths
         .iter()
-        .map(|f| {
-            let f = f
-                .to_str()
-                .expect("Funky file detected")
-                .rsplit('/')
-                .nth(1)
-                .unwrap();
-
-            let ts = f
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>();
-
-            Some(ts.parse::<i64>().unwrap())
+        .filter_map(|f| {
+            let name = f.parent()?.file_name()?;
+            name.to_str()
         })
         .collect::<Vec<_>>();
 
     let query = match ud {
-        UpDown::Up => "SELECT * FROM __pgm_meta__ WHERE id = ANY($1) ORDER BY id ASC",
-        UpDown::Down => "SELECT * FROM __pgm_meta__ WHERE id = ANY($1) ORDER BY id DESC",
+        UpDown::Up => "SELECT * FROM __migr_meta__ WHERE id = ANY($1) ORDER BY id ASC",
+        UpDown::Down => "SELECT * FROM __migr_meta__ WHERE id = ANY($1) ORDER BY id DESC",
     };
 
     let migs = match pg.query(query, &[&mig_ids]) {
         Ok(rows) => rows
             .into_iter()
-            .map(|r| (r.get::<usize, i64>(0), r.get::<usize, bool>(1))),
-        Err(e) => {
-            let err = e.to_string();
-            if err.contains("relation \"__pgm_meta__\" does not exist") {
-                return Err(Error::new(
-                    io::ErrorKind::Other,
-                    "The metadata table does not exist, have you run `pgm setup`?",
-                ));
-            } else {
-                return Err(Error::new(io::ErrorKind::Other, err));
-            }
-        }
+            .map(|r| (r.get::<usize, String>(0), r.get::<usize, bool>(1))),
+        Err(e) => return Err(Error::new(e)),
     };
 
-    Ok(migs)
+    Ok(migs.collect())
 }
 
-fn migration_files(path: &str, ud: UpDown) -> Result<Vec<PathBuf>, Error> {
-    let rd = fs::read_dir(path)?;
+fn migration_files(path: &PathBuf, ud: UpDown) -> Result<Vec<PathBuf>, Error> {
+    let mig_dirs = fs::read_dir(path)?;
     let mut pending = vec![];
     let ty = match ud {
         UpDown::Up => "up.sql",
         UpDown::Down => "down.sql",
     };
 
-    for mig in rd {
+    for mig in mig_dirs {
         let entry = mig?.path();
+
         if !entry.is_dir() {
             continue;
         }
 
         let updown = entry.read_dir()?;
+
         let file = updown
             .filter_map(Result::ok)
             .find(|e| match e.file_name().into_string() {
                 Ok(e) => e.contains(ty),
                 Err(_) => false,
             })
-            .unwrap_or_else(|| {
-                panic!(
+            .ok_or_else(|| {
+                Error::msg(format!(
                     "{} does not contain the necessary `{ty}` file.",
                     entry.display(),
-                )
-            });
+                ))
+            })?;
+
         pending.push(file.path())
     }
+
     pending.sort();
+
     Ok(pending)
 }
 
-fn timestamp() -> i64 {
-    // Number of seconds from 1970-01-01 to 2000-01-01
-    const TIME_SEC_CONVERSION: u64 = 946684800;
-    const NSEC_PER_USEC: u64 = 1000;
-    const USEC_PER_SEC: u64 = 1000000;
-
-    let epoch = UNIX_EPOCH + Duration::from_secs(TIME_SEC_CONVERSION);
-
-    let to_usec =
-        |d: Duration| d.as_secs() * USEC_PER_SEC + u64::from(d.subsec_nanos()) / NSEC_PER_USEC;
-
-    match SystemTime::now().duration_since(epoch) {
-        Ok(duration) => to_usec(duration) as i64,
-        Err(e) => -(to_usec(e.duration()) as i64),
-    }
-}
-
+#[derive(Debug, Clone, Copy)]
 enum UpDown {
     Up,
     Down,
+}
+
+impl Display for UpDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpDown::Up => write!(f, "up.sql"),
+            UpDown::Down => write!(f, "down.sql"),
+        }
+    }
 }
