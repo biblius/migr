@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "migr"
-version = "0.1.0"
+version = "0.1.1"
 description = "A minimal migration tool for postgres."
 license = "MIT"
 homepage = "https://github.com/biblius/pg_migrator"

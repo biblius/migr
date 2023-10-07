@@ -237,6 +237,23 @@ pub fn sync(trim: bool, path: &PathBuf, pg: &mut Client) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn status(pg: &mut Client) -> anyhow::Result<()> {
+    let rows = pg.query("SELECT * FROM __migr_meta__ ORDER BY id ASC", &[])?;
+    let rows = rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, bool>(1)));
+    info!("Status:");
+    for (id, pending) in rows {
+        let pending = if pending {
+            "pending".yellow()
+        } else {
+            "executed".green()
+        };
+        info!("{:.<50} {pending}", id);
+    }
+    Ok(())
+}
+
 fn migration_up(count: Option<usize>, path: PathBuf, pg: &mut Client) -> anyhow::Result<usize> {
     let paths = migration_files(&path, UpDown::Up)?;
     let meta = migration_meta(&paths, pg, UpDown::Up)?;

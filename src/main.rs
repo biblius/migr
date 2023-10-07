@@ -1,7 +1,7 @@
 use crate::migration::migration_generate;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use migration::{migration_redo, migration_rev, migration_run, setup, sync};
+use migration::{migration_redo, migration_rev, migration_run, setup, status, sync};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, path::PathBuf};
 
@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
     let mut pg = establish_connection(&url);
 
     match migr.command {
+        MigrationSubcommand::Status => status(&mut pg),
         MigrationSubcommand::Setup => {
             let path = format!("{}/migrations", migr.path.as_deref().unwrap_or("."));
             setup(path.into(), &mut pg)
@@ -84,6 +85,8 @@ pub struct Migr {
 
 #[derive(Debug, Subcommand)]
 pub enum MigrationSubcommand {
+    /// Show the state of migrations in the metadata table.
+    Status,
     /// Initialise a migration directory, set up the initial migration and create the metadata table.
     Setup,
     /// Sync existing/edited migrations with migr.
